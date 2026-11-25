@@ -42,10 +42,47 @@ powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -Game "<your game fold
 (a DualShock/DualSense through DS4Windows works). With no pad connected the
 keyboard acts as one while the game window has focus.
 
-## Faster settings (optional, off by default)
+## Faster settings (on by default)
 
-`VICTORY_RELAY=2`, or `VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1` cut frame
-time on the test machines. Set them in PowerShell before running the script.
+These used to be opt-in. Each one can be turned back off for a comparison,
+or if it shows a problem, by setting the value in the right column.
+
+| Setting | Turn off |
+|---|---|
+| CPU and GPU work at the same time: submissions go ahead, what shaders wrote comes back on its own thread (`VICTORY_RELAY=2`) | `VICTORY_RELAY=0` (`=1`: first stage only) |
+| Snapshots and compares, refreshes, and merges on several threads | `VICTORY_WIDE_BACK=0`, `VICTORY_WIDE_REFRESH=0`, `VICTORY_WIDE_MERGE=0` |
+| Texture refreshes do not wait for the runtime's remapping (a texture may show a frame later) | `VICTORY_TEXTURE_NO_WAIT=0` |
+| Title buffer copies that follow each other done as one | `VICTORY_JOIN_COPIES=0` |
+| The card's re-hash passes joined into runs | `VICTORY_CARD_REHASH_RUNS=0` |
+| Up to 512 MB of the title's loose memory (vertices, indices, constants) kept in the card's memory instead of read over the bus, while a fifth of the card's budget is free | `VICTORY_CARD_WINDOWS_MB=0` (or another size in MB) |
+
+Also: the card compares its copies with a group of 256 threads per 64 KiB
+piece instead of one thread; the device is made on the high-performance
+adapter (the discrete card on a laptop, named as `host adapter` in the log);
+release builds use fat LTO, one codegen unit and `x86-64-v3` (AVX2).
+
+## Title memory in place (experiment, off by default)
+
+`VICTORY_INPLACE=1`: memory the card reads outside title buffers is not
+copied for it; the card reads the title's own bytes (no copy, no refresh,
+no copy-back), as the console does. `VICTORY_POOL_COMMIT=1` with it also
+covers the title's physical page pool: the pool is then committed whole at
+the start (about 6 GB of commit, so the paging file needs room; if Windows
+refuses, it is reserved as before and stays copied). The log line `title
+memory in place` says how much is in place.
+
+## Measuring the frame rate
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\bench.ps1 -Game "<your game folder>\<the game's exe>"
+```
+
+`scripts\bench.ps1` runs the game once per set of switches (`-Configs`; by
+default the faster settings, then all of them off, then each one off on its own), for
+`-Seconds` each, then prints a table of the frame-rate lines: fps, and per
+frame the time preparing (copies, textures), waiting for the GPU and copying
+back. Get to the same place in every run (same save, standing still), or use
+the diagnostics build with `-Keys`. `-MinDraws` leaves out menu frames.
 
 ## Debugging switches
 

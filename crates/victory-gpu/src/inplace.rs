@@ -138,10 +138,16 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if level() < if window { 1 } else { 2 } {
         return None;
     }
-    // View memory: known from the runtime without asking Windows.
-    if cover(start as usize, len as usize) != Cover::None {
-        STATS[4].fetch_add(1, Ordering::Relaxed);
-        return None;
+    // View memory: known from the runtime without asking Windows. One run
+    // of a section made committed (`VICTORY_POOL_COMMIT=1`) is placed over
+    // the section itself; anything else of it is copied, as before.
+    match cover(start as usize, len as usize) {
+        Cover::None => {}
+        Cover::Run(section, offset) => return place_view(section, offset, start, len, window),
+        Cover::Holes | Cover::Scattered => {
+            STATS[4].fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
     }
     if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
         STATS[6].fetch_add(1, Ordering::Relaxed);
@@ -166,6 +172,73 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
             None
         }
     }
+}
+
+/// Title memory `[start, start + len)`, which views show as one run of
+/// `section` from `offset` on, in place: a buffer placed in the section
+/// opened as a host heap, from the 64 KiB page that holds `start`.
+///
+/// Opening a section locks nothing (unlike memory opened by address), so
+/// it does not count against [`most`]; each section is opened once and
+/// kept ([`SECTION_HEAPS`]). What the views show the GPU sees, with no
+/// copy, refresh or copy-back; when the runtime maps the range anew,
+/// `crate::watch::title_memory_remapped` lets the buffer go
+/// ([`title_memory_freeing`]), as for private memory.
+fn place_view(section: usize, offset: u64, start: u64, len: u64, window: bool) -> Option<Placed> {
+    let committed = views().sections.iter().any(|s| s.0 == section && s.2);
+    if !committed {
+        STATS[4].fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let bias = start % K64 as u64;
+    let Some(at) = offset.checked_sub(bias) else {
+        STATS[4].fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
+    let bytes = (start + len.max(1)).next_multiple_of(K64 as u64) - (start - bias);
+    let host = crate::host::host()?;
+    let placed = (|| -> windows::core::Result<Placed> {
+        let heap = section_heap(&host.device, section)?;
+        let buffer = place(&host.device, &heap, at, bytes)?;
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() } + bias;
+        Ok(Placed { buffer, heap, gpu, bias })
+    })();
+    match placed {
+        Ok(placed) => {
+            let at = if window { 0 } else { 2 };
+            STATS[at].fetch_add(1, Ordering::Relaxed);
+            STATS[at + 1].fetch_add(len, Ordering::Relaxed);
+            Some(placed)
+        }
+        Err(e) => {
+            if STATS[5].fetch_add(1, Ordering::Relaxed) < 8 {
+                tracing::warn!(start = format_args!("{start:#x}"), len, error = %e, "view memory not opened in place: a copy instead");
+            }
+            None
+        }
+    }
+}
+
+/// A section opened as a host heap.
+struct SectionHeap(ID3D12Heap);
+// SAFETY: Direct3D 12 heaps are free-threaded.
+unsafe impl Send for SectionHeap {}
+
+/// The title's committed sections opened as host heaps, by handle
+/// ([`place_view`]); forgotten when the runtime makes a section under the
+/// same handle ([`title_memory_section`]).
+static SECTION_HEAPS: Mutex<Vec<(usize, SectionHeap)>> = Mutex::new(Vec::new());
+
+/// `section` as a host heap: opened on first use, then kept.
+fn section_heap(device: &ID3D12Device, section: usize) -> windows::core::Result<ID3D12Heap> {
+    let mut heaps = SECTION_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, heap)) = heaps.iter().find(|h| h.0 == section) {
+        return Ok(heap.0.clone());
+    }
+    let heap = open(device, From::Section(section))?;
+    heaps.push((section, SectionHeap(heap.clone())));
+    Ok(heap)
 }
 
 /// What [`place_for`] gave is gone.
@@ -283,6 +356,9 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
     let mut v = views();
     v.sections.retain(|s| s.0 != section);
     v.sections.push((section, bytes, committed));
+    drop(v);
+    // A heap opened on an earlier section under this handle is not this one.
+    SECTION_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).retain(|h| h.0 != section);
 }
 
 /// The runtime mapped `[at, at + len)` as a view of `section` from
@@ -1039,6 +1115,18 @@ mod tests {
         assert_eq!(cover_in(&views, at + 6 * K64, 3 * K64), Cover::Holes);
         assert_eq!(cover_in(&views, at + 7 * K64, K64), Cover::None);
         assert_eq!(cover_in(&views, at - K64, 2 * K64), Cover::None);
+    }
+
+    /// A run of a reserved section is never placed: the host would refuse
+    /// to open it. Nothing is asked of a host GPU for it.
+    #[test]
+    fn a_reserved_section_is_not_placed() {
+        let section = 0x5eed_0001usize;
+        title_memory_section(section, 64 * K64 as u64, false);
+        assert!(place_view(section, 2 * K64 as u64, 0x7_8000_0000, K64 as u64, true).is_none());
+        // A start below its page's offset in the section is not placed either.
+        title_memory_section(section, 64 * K64 as u64, true);
+        assert!(place_view(section, 0, 0x7_8000_0000 + 0x100, 16, true).is_none());
     }
 
     /// What the runtime forgets when memory is mapped anew.

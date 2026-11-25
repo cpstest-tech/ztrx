@@ -36,6 +36,8 @@ windows-sys = "0.61.2"
 windows = "0.62.2"
 windows-core = "0.62.2"
 blake3 = "1.8.7"
+# Change detection of title memory (not a content address): xxh3, 128 bits.
+xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 memchr = "2.8.3"
 miniz_oxide = "0.9.1"
 walkdir = "2.5.1"
@@ -70,6 +72,11 @@ opt-level = 2
 
 [profile.release]
 debug = "line-tables-only"
+# ztrx: the whole program optimised as one unit. Slower to build (several
+# minutes), faster to run: the submitting thread's preparing, copying and
+# comparing is CPU-bound.
+lto = "fat"
+codegen-units = 1
 
 # The development build: release code generation plus the `diagnostics`
 # feature (`cargo build --profile diag -p victory --features diagnostics`),

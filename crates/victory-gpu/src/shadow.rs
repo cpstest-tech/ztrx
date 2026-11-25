@@ -225,7 +225,7 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
 }
 
 /// The most bytes of windows outside buffers whose copies go to the card's
-/// memory (`VICTORY_CARD_WINDOWS_MB`; 0, the default, none).
+/// memory (`VICTORY_CARD_WINDOWS_MB`; 512 unless set, 0: none).
 ///
 /// Windows are two thirds of the PC memory the card shares (run 104: 861
 /// windows, 3,552 MB of 5,400), and every draw that takes vertices, indices
@@ -242,10 +242,15 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
 /// card later windows stay where they are. The CPU's side stays in the PC's
 /// memory, so the memory shared with the card does not shrink by this
 /// alone; what moves is what shaders read.
+///
+/// ztrx: on by default (it was 0). The card's own time is the floor under
+/// the frame (about 242 ms of it, see `crate::host::relay`), and reads over
+/// the bus are part of it; the copies of title buffers on the card already
+/// took one list from 50.5 to 4.5 ms (run 75).
 fn window_card_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
+        std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(512) << 20
     })
 }
 
@@ -470,7 +475,7 @@ mod card_tests {
 ///   had not received from bytes the card wrote.
 pub(crate) fn relay() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_RELAY").is_ok_and(|v| v == "1" || v == "2") && !keeps())
+    *ON.get_or_init(|| !std::env::var("VICTORY_RELAY").is_ok_and(|v| v == "0") && !keeps())
 }
 
 /// The submission being prepared (its number among those started): what
@@ -958,7 +963,7 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
 /// lists only afterwards).
 pub(crate) fn wide_back() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK").is_none_or(|v| v != "0"))
 }
 
 type Job = Box<dyn FnOnce() + Send>;

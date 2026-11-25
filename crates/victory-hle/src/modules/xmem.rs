@@ -342,7 +342,25 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-struct Section(HANDLE);
+/// Whether the title's physical pages are made as a section committed
+/// whole (`VICTORY_POOL_COMMIT=1`; off by default; always under Wine).
+///
+/// Reserved, as by default, the section cannot be opened as a host heap
+/// (Direct3D refuses `SEC_RESERVE`), so the GPU side copies every buffer
+/// and window in it to the host and back. Committed, the views that show
+/// one run of it can be placed in the card's reach as they are, with
+/// `VICTORY_INPLACE` (`victory_gpu`'s in-place memory). What it costs: the
+/// whole pool (6.1 GiB asked at once) counts against the system's commit
+/// limit from the start, so the paging file must have room; if it has
+/// not, the section is reserved as before.
+fn pool_commit() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_POOL_COMMIT").is_some_and(|v| v == "1"));
+    *ON
+}
+
+/// A section of physical pages, and whether it was made committed whole
+/// (`SEC_COMMIT`): its views then need no commit of their own.
+struct Section(HANDLE, bool);
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -401,20 +419,39 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // A pagefile-backed section of `size` bytes, its pages committed when
     // first mapped or written (`commit`): the title asks for 6.1
     // GiB at once, which a busy host often cannot commit (error 1450).
-    // SAFETY: plain section creation.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
+    // Under Wine a committed section is a sparse file, free until touched,
+    // and committing a reserved one page by page costs a wineserver
+    // request each that scans every range committed so far: commit it
+    // whole there. With `VICTORY_POOL_COMMIT=1` ([`pool_commit`]) it is
+    // committed whole here too, so the GPU side can open it as a host heap
+    // (`victory_gpu`'s in-place memory), and reserved as before if Windows
+    // cannot commit that much.
+    let make = |attributes: u32| {
+        // SAFETY: plain section creation.
+        unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | attributes,
+                (size as u64 >> 32) as u32,
+                size as u32,
+                std::ptr::null(),
+            )
+        }
+    };
+    let (handle, committed) = if on_wine() {
+        (make(SEC_COMMIT), true)
+    } else if pool_commit() {
+        let handle = make(SEC_COMMIT);
+        if handle.is_null() {
+            let error = std::io::Error::last_os_error();
+            tracing::warn!(n, %error, "physical pages not committed whole (VICTORY_POOL_COMMIT): reserved instead, and not in place");
+            (make(SEC_RESERVE), false)
+        } else {
+            (handle, true)
+        }
+    } else {
+        (make(SEC_RESERVE), false)
     };
     if handle.is_null() {
         let error = std::io::Error::last_os_error();
@@ -430,8 +467,8 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     );
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
-    let section = Arc::new(Section(handle));
+    victory_gpu::title_memory_section(handle as usize, size as u64, committed);
+    let section = Arc::new(Section(handle, committed));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -492,7 +529,7 @@ impl View {
             return None;
         }
         let view = View { at, len };
-        commit(at.Value as usize, len).then_some(view)
+        commit(at.Value as usize, len, slice.section.1).then_some(view)
     }
 
     fn bytes(&mut self) -> &mut [u8] {
@@ -731,7 +768,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         );
         return false;
     }
-    if !commit(base, len) {
+    if !commit(base, len, slice.section.1) {
         // SAFETY: the view just mapped, back to a placeholder.
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
@@ -744,10 +781,11 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     true
 }
 
-/// Commits the section pages a view shows (once per page, whichever view).
-fn commit(base: usize, len: usize) -> bool {
-    if on_wine() {
-        return true; // sections are committed whole there
+/// Commits the section pages a view shows (once per page, whichever view),
+/// unless the section was made committed whole (`committed`).
+fn commit(base: usize, len: usize, committed: bool) -> bool {
+    if committed || on_wine() {
+        return true;
     }
     // SAFETY: `[base, base + len)` is a view of a reserved section.
     if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {

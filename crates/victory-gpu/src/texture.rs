@@ -58,11 +58,20 @@ pub(crate) struct Staging {
     used: std::sync::atomic::AtomicU64,
 }
 
+/// The hash a texture's memory is compared by to tell whether it changed:
+/// xxh3, 128 bits. It was BLAKE3, a cryptographic hash, over every texture
+/// refresh's bytes (up to hundreds of MB a frame while the world streams
+/// in); nothing here needs more than to tell a change, and xxh3 does that
+/// several times faster, at about the speed the memory is read.
+fn change_hash(bytes: &[u8]) -> u128 {
+    xxhash_rust::xxh3::xxh3_128(bytes)
+}
+
 /// What a texture's staging buffer holds: the hash of the memory detiled
 /// (memory not watched), or the write-watch asking it was detiled after.
 #[derive(Default)]
 struct Last {
-    hash: Option<blake3::Hash>,
+    hash: Option<u128>,
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
@@ -303,7 +312,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 /// is remapping may show a frame later. It never shows partly read.
 fn no_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_none_or(|v| v != "0"))
 }
 
 /// Since the last frame-rate line, with [`no_wait`]: refreshes that read
@@ -692,7 +701,7 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                let hash = blake3::hash(read);
+                let hash = change_hash(read);
                 if last.hash == Some(hash) {
                     return false;
                 }
@@ -712,7 +721,7 @@ impl Staging {
         }
         if through_copy() {
             return with_title(self.memory, size, |tiled| {
-                let hash = blake3::hash(tiled);
+                let hash = change_hash(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if last.hash == Some(hash) {
@@ -728,7 +737,7 @@ impl Staging {
         // SAFETY: committed memory of the texture's layout size, and it
         // stays committed while `_mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = blake3::hash(tiled);
+        let hash = change_hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
@@ -753,7 +762,7 @@ impl Staging {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
-            let hash = blake3::hash(read);
+            let hash = change_hash(read);
             if last.hash != Some(hash) {
                 last.hash = Some(hash);
                 self.detile(read);

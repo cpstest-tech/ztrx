@@ -690,7 +690,8 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                let (x, y) = crate::host::card_compare_groups(PIECES);
+                warp.list.Dispatch(x, y, 1);
             }
             warp.submit_and_wait();
             // SAFETY: as above.
